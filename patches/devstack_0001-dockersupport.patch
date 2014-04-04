@@ -1,0 +1,368 @@
+From 15750ba4eae949a00317508e7b0f99445484dfa7 Mon Sep 17 00:00:00 2001
+From: Derek Higgins <derekh@redhat.com>
+Date: Fri, 4 Apr 2014 20:12:04 +0000
+Subject: [PATCH] Restore docker support to devstack
+
+Returns the docker support to devstack, this is mainly a revert of
+7d4c7e09b4882077471c3b2cb097c237c2016f96.
+---
+ README.md                          |   4 ++
+ exercises/boot_from_volume.sh      |   3 +
+ exercises/euca.sh                  |   3 +
+ exercises/floating_ips.sh          |   3 +
+ exercises/sec_groups.sh            |   3 +
+ exercises/volumes.sh               |   3 +
+ lib/glance                         |   3 +
+ lib/nova_plugins/hypervisor-docker | 129 +++++++++++++++++++++++++++++++++++++
+ stackrc                            |   3 +
+ tools/docker/README.md             |  13 ++++
+ tools/docker/install_docker.sh     |  68 +++++++++++++++++++
+ 11 files changed, 235 insertions(+)
+ create mode 100644 lib/nova_plugins/hypervisor-docker
+ create mode 100644 tools/docker/README.md
+ create mode 100755 tools/docker/install_docker.sh
+
+diff --git a/README.md b/README.md
+index 89e3855..755e9dd 100644
+--- a/README.md
++++ b/README.md
+@@ -271,6 +271,10 @@ If tempest has been successfully configured, a basic set of smoke tests can be r
+ 
+ If you would like to use Xenserver as the hypervisor, please refer to the instructions in `./tools/xen/README.md`.
+ 
++# DevStack on Docker
++
++If you would like to use Docker as the hypervisor, please refer to the instructions in `./tools/docker/README.md`.
++
+ # Additional Projects
+ 
+ DevStack has a hook mechanism to call out to a dispatch script at specific
+diff --git a/exercises/boot_from_volume.sh b/exercises/boot_from_volume.sh
+index d756685..056e81e 100755
+--- a/exercises/boot_from_volume.sh
++++ b/exercises/boot_from_volume.sh
+@@ -47,6 +47,9 @@ is_service_enabled cinder || exit 55
+ # Ironic does not support boot from volume.
+ [ "$VIRT_DRIVER" == "ironic" ] && exit 55
+ 
++# Also skip if the hypervisor is Docker
++[[ "$VIRT_DRIVER" == "docker" ]] && exit 55
++
+ # Instance type to create
+ DEFAULT_INSTANCE_TYPE=${DEFAULT_INSTANCE_TYPE:-m1.tiny}
+ 
+diff --git a/exercises/euca.sh b/exercises/euca.sh
+index f9c4752..633986b 100755
+--- a/exercises/euca.sh
++++ b/exercises/euca.sh
+@@ -43,6 +43,9 @@ source $TOP_DIR/lib/neutron
+ # the exercise is skipped
+ is_service_enabled n-api || exit 55
+ 
++# Skip if the hypervisor is Docker
++[[ "$VIRT_DRIVER" == "docker" ]] && exit 55
++
+ # Instance type to create
+ DEFAULT_INSTANCE_TYPE=${DEFAULT_INSTANCE_TYPE:-m1.tiny}
+ 
+diff --git a/exercises/floating_ips.sh b/exercises/floating_ips.sh
+index 7e90e5a..fc61d08 100755
+--- a/exercises/floating_ips.sh
++++ b/exercises/floating_ips.sh
+@@ -40,6 +40,9 @@ source $TOP_DIR/exerciserc
+ # the exercise is skipped
+ is_service_enabled n-api || exit 55
+ 
++# Skip if the hypervisor is Docker
++[[ "$VIRT_DRIVER" == "docker" ]] && exit 55
++
+ # Instance type to create
+ DEFAULT_INSTANCE_TYPE=${DEFAULT_INSTANCE_TYPE:-m1.tiny}
+ 
+diff --git a/exercises/sec_groups.sh b/exercises/sec_groups.sh
+index 5f8b0a4..d71a1e0 100755
+--- a/exercises/sec_groups.sh
++++ b/exercises/sec_groups.sh
+@@ -37,6 +37,9 @@ source $TOP_DIR/exerciserc
+ # the exercise is skipped
+ is_service_enabled n-api || exit 55
+ 
++# Skip if the hypervisor is Docker
++[[ "$VIRT_DRIVER" == "docker" ]] && exit 55
++
+ 
+ # Testing Security Groups
+ # =======================
+diff --git a/exercises/volumes.sh b/exercises/volumes.sh
+index 1dff6a4..950b048 100755
+--- a/exercises/volumes.sh
++++ b/exercises/volumes.sh
+@@ -44,6 +44,9 @@ is_service_enabled cinder || exit 55
+ # Ironic does not currently support volume attachment.
+ [ "$VIRT_DRIVER" == "ironic" ] && exit 55
+ 
++# Also skip if the hypervisor is Docker
++[[ "$VIRT_DRIVER" == "docker" ]] && exit 55
++
+ # Instance type to create
+ DEFAULT_INSTANCE_TYPE=${DEFAULT_INSTANCE_TYPE:-m1.tiny}
+ 
+diff --git a/lib/glance b/lib/glance
+index 51e4399..7520535 100644
+--- a/lib/glance
++++ b/lib/glance
+@@ -125,6 +125,9 @@ function configure_glance {
+         iniset $GLANCE_API_CONF DEFAULT disk_formats "ami,ari,aki,vhd,raw,iso"
+     fi
+ 
++    # Docker add images to glance with very long metadata
++    iniset $GLANCE_API_CONF DEFAULT max_header_line 1638400000
++
+     # Store the images in swift if enabled.
+     if is_service_enabled s-proxy; then
+         iniset $GLANCE_API_CONF DEFAULT default_store swift
+diff --git a/lib/nova_plugins/hypervisor-docker b/lib/nova_plugins/hypervisor-docker
+new file mode 100644
+index 0000000..29789c5
+--- /dev/null
++++ b/lib/nova_plugins/hypervisor-docker
+@@ -0,0 +1,129 @@
++# lib/nova_plugins/docker
++# Configure the Docker hypervisor
++
++# Enable with:
++#
++#   VIRT_DRIVER=docker
++
++# Dependencies:
++#
++# - ``functions`` file
++# - ``nova`` and ``glance`` configurations
++
++# install_nova_hypervisor - install any external requirements
++# configure_nova_hypervisor - make configuration changes, including those to other services
++# start_nova_hypervisor - start any external services
++# stop_nova_hypervisor - stop any external services
++# cleanup_nova_hypervisor - remove transient data and cache
++
++# Save trace setting
++MY_XTRACE=$(set +o | grep xtrace)
++set +o xtrace
++
++
++# Defaults
++# --------
++
++# Set up default directories
++DOCKER_DIR=$DEST/docker
++
++DOCKER_UNIX_SOCKET=/var/run/docker.sock
++DOCKER_PID_FILE=/var/run/docker.pid
++DOCKER_REGISTRY_PORT=${DOCKER_REGISTRY_PORT:-5042}
++
++DOCKER_IMAGE=${DOCKER_IMAGE:-cirros:latest}
++DOCKER_IMAGE_NAME=$DEFAULT_IMAGE_NAME
++DOCKER_REGISTRY_IMAGE=${DOCKER_REGISTRY_IMAGE:-registry:latest}
++DOCKER_REGISTRY_IMAGE_NAME=registry
++DOCKER_REPOSITORY_NAME=${SERVICE_HOST}:${DOCKER_REGISTRY_PORT}/${DOCKER_IMAGE_NAME}
++
++DOCKER_APT_REPO=${DOCKER_APT_REPO:-https://get.docker.io/ubuntu}
++
++
++# Entry Points
++# ------------
++
++# clean_nova_hypervisor - Clean up an installation
++function cleanup_nova_hypervisor {
++    stop_service docker
++
++    # Clean out work area
++    sudo rm -rf /var/lib/docker
++}
++
++# configure_nova_hypervisor - Set config files, create data dirs, etc
++function configure_nova_hypervisor {
++    iniset $NOVA_CONF DEFAULT compute_driver novadocker.virt.docker.driver.DockerDriver
++    iniset $GLANCE_API_CONF DEFAULT container_formats ami,ari,aki,bare,ovf,docker
++}
++
++# is_docker_running - Return 0 (true) if Docker is running, otherwise 1
++function is_docker_running {
++    local docker_pid
++    if [ -f "$DOCKER_PID_FILE" ]; then
++        docker_pid=$(cat "$DOCKER_PID_FILE")
++    fi
++    if [[ -z "$docker_pid" ]] || ! ps -p "$docker_pid" | grep [d]ocker; then
++        return 1
++    fi
++    return 0
++}
++
++# install_nova_hypervisor() - Install external components
++function install_nova_hypervisor {
++    # Make sure Docker is installed
++    if ! ( is_package_installed docker-io || is_package_installed lxc-docker ) ; then
++        die $LINENO "Docker is not installed.  Please run tools/docker/install_docker.sh"
++    fi
++
++    if ! (is_docker_running); then
++        die $LINENO "Docker not running"
++    fi
++
++    is_package_installed dnsmasq || install_package dnsmasq
++}
++
++# start_nova_hypervisor - Start any required external services
++function start_nova_hypervisor {
++    if ! (is_docker_running); then
++        die $LINENO "Docker not running"
++    fi
++
++    # Start the Docker registry container
++    sudo docker run -d -p ${DOCKER_REGISTRY_PORT}:5000 \
++        -e SETTINGS_FLAVOR=openstack -e OS_USERNAME=${OS_USERNAME} \
++        -e OS_PASSWORD=${OS_PASSWORD} -e OS_TENANT_NAME=${OS_TENANT_NAME} \
++        -e OS_GLANCE_URL="${SERVICE_PROTOCOL}://${GLANCE_HOSTPORT}" \
++        -e OS_AUTH_URL=${OS_AUTH_URL} \
++        $DOCKER_REGISTRY_IMAGE_NAME ./docker-registry/run.sh
++
++    echo "Waiting for docker registry to start..."
++    DOCKER_REGISTRY=${SERVICE_HOST}:${DOCKER_REGISTRY_PORT}
++    if ! timeout $SERVICE_TIMEOUT sh -c "while ! curl -s $DOCKER_REGISTRY; do sleep 1; done"; then
++        die $LINENO "docker-registry did not start"
++    fi
++
++    # Tag image if not already tagged
++    if ! sudo docker images | grep $DOCKER_REPOSITORY_NAME; then
++        sudo docker tag $DOCKER_IMAGE_NAME $DOCKER_REPOSITORY_NAME
++    fi
++
++    # Make sure we copied the image in Glance
++    if ! (glance image-show "$DOCKER_IMAGE"); then
++        sudo docker push $DOCKER_REPOSITORY_NAME
++    fi
++}
++
++# stop_nova_hypervisor - Stop any external services
++function stop_nova_hypervisor {
++    # Stop the docker registry container
++    sudo docker kill $(docker ps | grep docker-registry | cut -d' ' -f1)
++}
++
++
++# Restore xtrace
++$MY_XTRACE
++
++# Local variables:
++# mode: shell-script
++# End:
+diff --git a/stackrc b/stackrc
+index 8320c9b..ea632c3 100644
+--- a/stackrc
++++ b/stackrc
+@@ -320,6 +320,9 @@ case "$VIRT_DRIVER" in
+     openvz)
+         DEFAULT_IMAGE_NAME=${DEFAULT_IMAGE_NAME:-ubuntu-12.04-x86_64}
+         IMAGE_URLS=${IMAGE_URLS:-"http://download.openvz.org/template/precreated/ubuntu-12.04-x86_64.tar.gz"};;
++    docker)
++        DEFAULT_IMAGE_NAME=${DEFAULT_IMAGE_NAME:-cirros}
++        IMAGE_URLS=${IMAGE_URLS:-};;
+     libvirt)
+         case "$LIBVIRT_TYPE" in
+             lxc) # the cirros root disk in the uec tarball is empty, so it will not work for lxc
+diff --git a/tools/docker/README.md b/tools/docker/README.md
+new file mode 100644
+index 0000000..976111f
+--- /dev/null
++++ b/tools/docker/README.md
+@@ -0,0 +1,13 @@
++# DevStack on Docker
++
++Using Docker as Nova's hypervisor requries two steps:
++
++* Configure DevStack by adding the following to `localrc`::
++
++    VIRT_DRIVER=docker
++
++* Download and install the Docker service and images::
++
++    tools/docker/install_docker.sh
++
++After this, `stack.sh` should run as normal.
+diff --git a/tools/docker/install_docker.sh b/tools/docker/install_docker.sh
+new file mode 100755
+index 0000000..3dd6527
+--- /dev/null
++++ b/tools/docker/install_docker.sh
+@@ -0,0 +1,68 @@
++#!/usr/bin/env bash
++
++# **install_docker.sh** - Do the initial Docker installation and configuration
++
++# install_docker.sh
++#
++# Install docker package and images
++# * downloads a base busybox image and a glance registry image if necessary
++# * install the images in Docker's image cache
++
++
++# Keep track of the current directory
++SCRIPT_DIR=$(cd $(dirname "$0") && pwd)
++TOP_DIR=$(cd $SCRIPT_DIR/../..; pwd)
++
++# Import common functions
++source $TOP_DIR/functions
++
++# Load local configuration
++source $TOP_DIR/stackrc
++
++FILES=$TOP_DIR/files
++
++# Get our defaults
++source $TOP_DIR/lib/nova_plugins/hypervisor-docker
++
++SERVICE_TIMEOUT=${SERVICE_TIMEOUT:-60}
++
++
++# Install Docker Service
++# ======================
++
++if is_fedora; then
++    install_package docker-io socat lxc
++else
++    # Stop the auto-repo updates and do it when required here
++    NO_UPDATE_REPOS=True
++
++    # Set up home repo
++    curl https://get.docker.io/gpg | sudo apt-key add -
++    install_package python-software-properties && \
++        sudo sh -c "echo deb $DOCKER_APT_REPO docker main > /etc/apt/sources.list.d/docker.list"
++    apt_get update
++    install_package --force-yes lxc-docker socat
++fi
++
++# Start the daemon - restart just in case the package ever auto-starts...
++restart_service docker
++
++echo "Waiting for docker daemon to start..."
++DOCKER_GROUP=$(groups | cut -d' ' -f1)
++CONFIGURE_CMD="while ! /bin/echo -e 'GET /v1.3/version HTTP/1.0\n\n' | socat - unix-connect:$DOCKER_UNIX_SOCKET 2>/dev/null | grep -q '200 OK'; do
++    # Set the right group on docker unix socket before retrying
++    sudo chgrp $DOCKER_GROUP $DOCKER_UNIX_SOCKET
++    sudo chmod g+rw $DOCKER_UNIX_SOCKET
++    sleep 1
++done"
++if ! timeout $SERVICE_TIMEOUT sh -c "$CONFIGURE_CMD"; then
++    die $LINENO "docker did not start"
++fi
++
++# Get guest container image
++docker pull $DOCKER_IMAGE
++docker tag $DOCKER_IMAGE $DOCKER_IMAGE_NAME
++
++# Get docker-registry image
++docker pull $DOCKER_REGISTRY_IMAGE
++docker tag $DOCKER_REGISTRY_IMAGE $DOCKER_REGISTRY_IMAGE_NAME
+-- 
+1.9.0
+

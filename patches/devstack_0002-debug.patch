@@ -1,0 +1,26 @@
+From ecb441b4237a244f784779bdd8af7a3d73066dab Mon Sep 17 00:00:00 2001
+From: Derek Higgins <derekh@redhat.com>
+Date: Wed, 9 Apr 2014 11:33:04 +0000
+Subject: [PATCH] i
+
+---
+ stack.sh | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/stack.sh b/stack.sh
+index 983a6bf..7897317 100755
+--- a/stack.sh
++++ b/stack.sh
+@@ -628,6 +628,10 @@ set -o xtrace
+ # Install Packages
+ # ================
+ 
++echo "================== derekh =="
++env
++echo "================== derekh =="
++
+ # OpenStack uses a fair number of other projects.
+ 
+ # Install package requirements
+-- 
+1.9.0

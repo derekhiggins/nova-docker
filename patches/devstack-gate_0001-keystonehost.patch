@@ -1,0 +1,26 @@
+From f0d70984ec6224716928c4de21b7785e70a19ced Mon Sep 17 00:00:00 2001
+From: Derek Higgins <derekh@redhat.com>
+Date: Wed, 9 Apr 2014 12:08:46 +0000
+Subject: [PATCH] Test
+
+---
+ devstack-vm-gate.sh | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/devstack-vm-gate.sh b/devstack-vm-gate.sh
+index 9413870..6df7cbc 100755
+--- a/devstack-vm-gate.sh
++++ b/devstack-vm-gate.sh
+@@ -140,6 +140,9 @@ UNDO_REQUIREMENTS=False
+ CINDER_PERIODIC_INTERVAL=10
+ CEILOMETER_PIPELINE_INTERVAL=15
+ export OS_NO_CACHE=True
++export KEYSTONE_SERVICE_HOST=$(ip addr show | awk '/inet / {print $2}' | grep -v 127.0.0.1 | head -n 1 | cut -d '/' -f 1)
++export KEYSTONE_ADMIN_BIND_HOST=0.0.0.0 ; export HOST_IP=$(ip addr show | awk '/inet / {print $2}' | grep -v 127.0.0.1 | head -n 1 | cut -d '/' -f 1)
++export SERVICE_HOST=$HOST_IP
+ EOF
+ 
+     if [ "$DEVSTACK_CINDER_SECURE_DELETE" -eq "0" ]; then
+-- 
+1.9.0
+
